@@ -55,7 +55,22 @@ const TIQUES_JANELA_AUTO_TESTE: u16 = 15 * TIQUES_POR_SEGUNDO;
 /// Duração do passo da bomba no auto-teste: 60 s (ou o botão Nível atalha).
 const TIQUES_BOMBA_AUTO_TESTE: u16 = 60 * TIQUES_POR_SEGUNDO;
 
-/// Condições que param a máquina e fazem o painel piscar.
+// ─── Código de erro piscado no painel ────────────────────────────────────────
+// O painel inteiro pisca N vezes, faz uma pausa e repete. N identifica o
+// erro — veja `Erro::piscadas()`.
+/// Parte acesa de cada piscada: 250 ms.
+pub const TIQUES_ERRO_ACESO: u16 = 5;
+/// Parte apagada de cada piscada: 250 ms.
+pub const TIQUES_ERRO_APAGADO: u16 = 5;
+/// Período de uma piscada completa: 500 ms.
+pub const TIQUES_ERRO_PISCADA: u16 = TIQUES_ERRO_ACESO + TIQUES_ERRO_APAGADO;
+/// Pausa escura entre duas repetições do código: 1,5 s.
+///
+/// Tem que ser bem maior que uma piscada, senão não se sabe onde a
+/// contagem começa.
+pub const TIQUES_ERRO_PAUSA: u16 = 30;
+
+/// Condições que param a máquina e fazem o painel piscar o código do erro.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Erro {
     /// Não atingiu o nível dentro do tempo.
@@ -64,6 +79,29 @@ pub enum Erro {
     Drenar,
     /// Nível caiu sozinho (vazamento ou sensor solto).
     Nivel,
+}
+
+impl Erro {
+    /// Quantas piscadas o painel dá para anunciar este erro.
+    ///
+    /// É o código de diagnóstico que o técnico conta em campo, sem
+    /// gravador e sem display:
+    ///
+    /// | Piscadas | Erro | O que suspeitar |
+    /// |---|---|---|
+    /// | 2 | [`Erro::Nivel`] | nível caiu sozinho — vazamento ou sensor solto |
+    /// | 3 | [`Erro::Encher`] | não encheu — válvula, torneira ou sensor de nível |
+    /// | 4 | [`Erro::Drenar`] | não esvaziou — eletrobomba, mangueira ou filtro |
+    ///
+    /// Os números não se repetem e começam em 2 de propósito: uma
+    /// piscada só se confundiria com o pisca de tampa aberta.
+    pub const fn piscadas(self) -> u16 {
+        match self {
+            Erro::Nivel => 2,
+            Erro::Encher => 3,
+            Erro::Drenar => 4,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,6 +152,8 @@ pub struct Fotografia {
     pub opcoes: Opcoes,
     pub executando: bool,
     pub desligada: bool,
+    /// `Some(erro)` quando a máquina está travada piscando um código.
+    pub erro: Option<Erro>,
 }
 
 pub struct Maquina<'a> {
@@ -247,6 +287,10 @@ impl<'a> Maquina<'a> {
             opcoes: self.opcoes,
             executando: matches!(self.estado, Estado::Executando),
             desligada: matches!(self.estado, Estado::Desligada),
+            erro: match self.estado {
+                Estado::Erro(e) => Some(e),
+                _ => None,
+            },
         }
     }
 
@@ -468,7 +512,7 @@ impl<'a> Maquina<'a> {
                 }
             }
 
-            Estado::Erro(_) => self.pisca_painel_inteiro(),
+            Estado::Erro(erro) => self.pisca_codigo_de_erro(erro),
 
             Estado::AutoTeste { passo, tiques } => self.auto_teste_tique(passo, tiques),
         }
@@ -970,15 +1014,39 @@ impl<'a> Maquina<'a> {
         self.salva();
     }
 
-    /// Pisca os 5 LEDs de programa juntos — sinal de erro.
-    fn pisca_painel_inteiro(&mut self) {
-        if !self.avanca_pisca() {
+    /// Pisca o painel inteiro no código do erro: N piscadas, pausa, repete.
+    ///
+    /// N vem de [`Erro::piscadas()`] — é o que o técnico conta em campo
+    /// para saber o que falhou sem precisar de gravador nem display.
+    ///
+    /// Os 10 LEDs piscam juntos (não só os de programa) para a contagem
+    /// ser visível de longe e não se confundir com a seleção de ciclo.
+    ///
+    /// ```text
+    /// Drenar (4):  ▀▁▀▁▀▁▀▁________________▀▁▀▁▀▁▀▁___ ...
+    ///              └── 4 × 500 ms ──┘└ 1,5 s ┘
+    /// ```
+    ///
+    /// O contador anda um tique por chamada e dá a volta no fim do ciclo.
+    /// O painel só é escrito quando o nível muda — entre duas transições
+    /// não se toca em GPIO nenhum.
+    fn pisca_codigo_de_erro(&mut self, erro: Erro) {
+        let trem = erro.piscadas() * TIQUES_ERRO_PISCADA;
+        let ciclo = trem + TIQUES_ERRO_PAUSA;
+
+        let t = self.pisca_contador;
+        self.pisca_contador = if t + 1 >= ciclo { 0 } else { t + 1 };
+
+        // Aceso só dentro do trem de piscadas, na primeira metade de cada uma.
+        let aceso = t < trem && (t % TIQUES_ERRO_PISCADA) < TIQUES_ERRO_ACESO;
+        if aceso == self.pisca_aceso {
             return;
         }
-        if self.pisca_aceso {
-            self.painel.acende_programas();
+        self.pisca_aceso = aceso;
+        if aceso {
+            self.painel.acende_tudo();
         } else {
-            self.painel.apaga_programas();
+            self.painel.apaga_tudo();
         }
     }
 

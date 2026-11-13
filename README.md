@@ -49,7 +49,8 @@ Por isso **o mapa de pinos do firmware é exatamente o mesmo do original**.
 | RAM | 12 KB |
 | Watchdog | FWDGT no IRC32K, configurado para **8 s** |
 
-**Uso atual do firmware: ~8,6 KB de flash e ~104 bytes de RAM estática.**
+**Uso atual do firmware: ~11,4 KB de flash e 100 bytes de RAM estática**
+(`text` 11.600 + `data` 60 bytes; `data` 60 + `bss` 40 em RAM).
 Sobra espaço de sobra para crescer.
 
 ---
@@ -285,7 +286,7 @@ Dá para ler o comportamento inteiro da máquina de cima a baixo num arquivo só
 ```
  Inicializando ──┐ teste dos LEDs (2,5 s)
                  ▼
-            Desligada ◀──────────── Erro  (pisca até on/off)
+            Desligada ◀──────────── Erro  (pisca o código até on/off)
              │    ▲                   ▲
       on/off │    │ on/off            │ falha de sensor
              ▼    │                   │
@@ -357,7 +358,7 @@ base de 50 ms (então nunca saem de fase):
 
 | Evento | Período | Quem usa |
 |---|---|---|
-| `Tique` | 50 ms | animação de boot, piscas do painel, padrão A/C da agitação, pulsos do motor C, as contagens de 2 s (confirmação e religar após tampa), a espera de 10 s do câmbio |
+| `Tique` | 50 ms | animação de boot, piscas do painel, o código de erro piscado, padrão A/C da agitação, pulsos do motor C, as contagens de 2 s (confirmação e religar após tampa), a espera de 10 s do câmbio |
 | `Segundo` | 1 s | duração das etapas, vigilância dos sensores, tempos limite de enchimento e drenagem |
 
 A divisão é a regra de leitura do código: **`Tique` mexe em hardware,
@@ -372,10 +373,10 @@ etapa depende da ação — e é aí que está o coração da lógica:
 
 | Ação | A etapa termina quando… | Falha se… |
 |---|---|---|
-| `EncherSabao`, `EncherEnxague`, `EncherAmaciante` | o **sensor** do nível escolhido é atingido | passam 40 min → `Erro::Encher` |
-| `Agitar`, `Molho` | o tempo da tabela se esgota | o nível cai em 5 leituras → `Erro::Nivel` |
+| `EncherSabao`, `EncherEnxague`, `EncherAmaciante` | o **sensor** do nível escolhido é atingido | passam 40 min → `Erro::Encher` (3 piscadas) |
+| `Agitar`, `Molho` | o tempo da tabela se esgota | o nível cai em 5 leituras → `Erro::Nivel` (2 piscadas) |
 | `MolhoEnxague` | o tempo se esgota, ou a sequência do amaciante acaba | — |
-| `Drenar` | os **dois** sensores de nível soltam | passam 4 min 20 s → `Erro::Drenar` |
+| `Drenar` | os **dois** sensores de nível soltam | passam 4 min 20 s → `Erro::Drenar` (4 piscadas) |
 | `Pulsos` | a tabela de pulsos progressivos acaba | — |
 | `DrenarExtra`, `Centrifugar`, `BombaPos`, `PausaFinal` | o tempo da tabela se esgota | — |
 
@@ -546,6 +547,23 @@ verifica:
 * a cadeia de programas vai até a centrifugação (seção 13);
 * no fim da cadeia volta para lavagem pesada, zera as opções e fica
   **desligada** — igual ao firmware original.
+
+Depois dos ciclos ela confere os **códigos de erro** (seção 10). Para cada
+um dos três erros, força a falha — válvula aberta e nível que nunca sobe,
+bomba ligada e tanque que nunca esvazia, nível que cai durante a
+agitação —, espera o tempo limite estourar e lê o painel tique a tique:
+
+* entrou no erro certo;
+* os 10 LEDs piscam **juntos** (nunca um subconjunto aceso);
+* a contagem dá exatamente N piscadas, três repetições seguidas;
+* toda piscada tem a mesma duração;
+* existem só dois tamanhos de escuro, e a pausa é ao menos 3× o intervalo
+  entre piscadas;
+* dois erros nunca piscam o mesmo número de vezes.
+
+Ela imprime o traço de cada código em `▀` e `_`, do jeito que se vê na
+máquina. É o único jeito prático de conferir isso: na placa, cada erro
+custaria até 40 min de tempo limite para aparecer uma vez.
 
 O `--edition 2021` é obrigatório: o `rustc` chamado solto usa a edição
 2015, onde os `use` internos da `maquina.rs` não resolvem.
@@ -726,8 +744,38 @@ Toda saída é de **lógica invertida**: nível BAIXO liga, nível ALTO desliga.
 * **Watchdog de 8 s** — se qualquer tarefa travar, o executor para,
   a tarefa `watchdog` para de alimentar o FWDGT e o MCU reinicia.
 * **`panic` trava o núcleo** (`panic-halt`) e o FWDGT reseta em 8 s.
-* **Erros com o painel piscando** até o usuário apertar on/off:
-  enchimento (40 min), drenagem (4 min 20 s) e queda de nível (5 leituras).
+* **Erros travam a máquina** com tudo desligado e o painel piscando um
+  código, até o usuário apertar on/off: enchimento (40 min), drenagem
+  (4 min 20 s) e queda de nível (5 leituras).
+
+### Códigos de erro piscados no painel
+
+Não há display na BWG10, então o erro se anuncia pelo **número de
+piscadas**. Os 10 LEDs piscam juntos N vezes, o painel fica escuro por
+1,5 s e o código repete — para sempre, até alguém apertar liga/desliga.
+
+| Piscadas | Erro | O que aconteceu | O que suspeitar |
+|---|---|---|---|
+| **2** | `Nivel` | o nível caiu sozinho durante a agitação ou o molho (5 leituras seguidas) | vazamento, mangueira solta, sensor de nível solto |
+| **3** | `Encher` | passaram 40 min enchendo e o nível escolhido não chegou | torneira fechada, válvula de sabão, sensor de nível |
+| **4** | `Drenar` | passaram 4 min 20 s drenando e o tanque não esvaziou | eletrobomba, mangueira de saída dobrada, filtro entupido |
+
+```text
+Drenar (4 piscadas):
+
+  ▀▀▀▀▀_____▀▀▀▀▀_____▀▀▀▀▀_____▀▀▀▀▀___________________________________
+  └ 250 ms acesa, 250 ms apagada ────────────┘└──── 1,5 s escuro ─────┘
+  └─────────────── uma repetição: 3,5 s ────────────────────────────────┘
+```
+
+A contagem **começa em 2** de propósito: uma piscada só se confundiria
+com o pisca do LED de programa, que é o aviso de tampa aberta. E a pausa
+é três vezes mais longa que o intervalo entre piscadas, senão não se sabe
+onde a contagem começa.
+
+Quem define o código é `Erro::piscadas()`, em `maquina.rs` — uma linha por
+erro. Para acrescentar um erro novo, dê a ele um número ainda não usado;
+o simulador reprova se dois erros piscarem a mesma quantidade (seção 7).
 
 ---
 

@@ -92,15 +92,6 @@ impl Painel {
         self.centrifugar.escreve(DESLIGADO);
     }
 
-    /// Acende os 5 LEDs de programa (usado no alerta de erro).
-    pub fn acende_programas(&self) {
-        self.pesada.escreve(LIGADO);
-        self.normal.escreve(LIGADO);
-        self.rapido.escreve(LIGADO);
-        self.enxaguar.escreve(LIGADO);
-        self.centrifugar.escreve(LIGADO);
-    }
-
     /// Acende apenas o LED do programa indicado; apaga os outros.
     pub fn mostra_programa(&self, p: Programa) {
         self.apaga_programas();

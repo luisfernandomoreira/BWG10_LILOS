@@ -187,11 +187,6 @@ mod placa {
                 l.alta();
             }
         }
-        pub fn acende_programas(&self) {
-            for l in self.programas() {
-                l.baixa();
-            }
-        }
         pub fn acende_tudo(&self) {
             for l in self.todos() {
                 l.baixa();
@@ -639,6 +634,278 @@ fn verifica(inicio: Programa, extra: bool, cenario: Cenario) -> Vec<String> {
     falhas
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// CÓDIGOS DE ERRO PISCADOS NO PAINEL
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Cada erro pisca o painel inteiro um número próprio de vezes, pausa e
+// repete. Conferir isso na placa custaria 40 min de tempo limite por erro,
+// então a contagem é verificada aqui: força-se a falha, lê-se o painel
+// tique a tique e conta-se o que um técnico contaria olhando a máquina.
+
+/// Como forçar cada erro.
+#[derive(Clone, Copy)]
+enum Falha {
+    /// Válvula aberta e o nível nunca sobe → tempo limite de 40 min.
+    NaoEnche,
+    /// Bomba ligada e o tanque nunca esvazia → tempo limite de 4 min 20 s.
+    NaoDrena,
+    /// Agitando com água e o nível cai sozinho → 5 leituras.
+    NivelCai,
+}
+
+const FALHAS: [Falha; 3] = [Falha::NaoEnche, Falha::NaoDrena, Falha::NivelCai];
+
+impl Falha {
+    fn nome(self) -> &'static str {
+        match self {
+            Falha::NaoEnche => "não encheu (válvula/torneira/sensor)",
+            Falha::NaoDrena => "não esvaziou (bomba/mangueira/filtro)",
+            Falha::NivelCai => "nível caiu sozinho (vazamento/sensor)",
+        }
+    }
+
+    fn esperado(self) -> maquina::Erro {
+        match self {
+            Falha::NaoEnche => maquina::Erro::Encher,
+            Falha::NaoDrena => maquina::Erro::Drenar,
+            Falha::NivelCai => maquina::Erro::Nivel,
+        }
+    }
+
+    /// Programa que começa na etapa certa para a falha acontecer.
+    fn programa(self) -> Programa {
+        match self {
+            // Etapa 0 = EncherSabao.
+            Falha::NaoEnche | Falha::NivelCai => Programa::Pesada,
+            // Etapa 0 = Drenar.
+            Falha::NaoDrena => Programa::Centrifugar,
+        }
+    }
+
+    /// Sensores no instante de energizar: `(médio, alto)`.
+    fn nivel_inicial(self) -> (bool, bool) {
+        match self {
+            Falha::NaoEnche => (false, false), // tanque vazio, e nunca enche
+            Falha::NaoDrena => (true, true),   // tanque cheio, e nunca esvazia
+            Falha::NivelCai => (true, false),  // já no nível: a agitação começa
+        }
+    }
+}
+
+/// Teto da busca pelo erro: 50 min simulados, folga sobre os 40 min do
+/// tempo limite de enchimento, que é o mais longo.
+const LIMITE_BUSCA_S: u32 = 50 * 60;
+
+/// Força a falha e devolve `(erro, traço do painel)`.
+///
+/// O traço tem uma amostra por tique de 50 ms, e cada amostra é
+/// **quantos** dos 10 LEDs estão acesos — assim o traço também prova que
+/// eles piscam juntos, e não um de cada vez.
+///
+/// A captura começa no tique seguinte ao instante em que o erro apareceu,
+/// que é exatamente onde o contador do pisca foi zerado — então o traço
+/// está em fase com o início da contagem, igual ao que se vê na placa.
+fn captura_codigo(falha: Falha) -> Option<(maquina::Erro, Vec<usize>)> {
+    let painel = Painel::nova();
+    let at = Atuadores::novos();
+    let entradas = Entradas::novas();
+
+    // A máquina lê os sensores uma vez no construtor: o nível tem de estar
+    // posto antes.
+    let (medio, alto) = falha.nivel_inicial();
+    entradas.nivel_medio.set(medio);
+    entradas.nivel_alto.set(alto);
+
+    let mut m = maquina::Maquina::nova(&painel, &at, &entradas);
+    m.restaura(EstadoSalvo {
+        programa: falha.programa(),
+        etapa: 0,
+        opcoes: Opcoes {
+            nivel_alto: false,
+            enxague_extra: false,
+            turbo: false,
+            amaciante: false,
+        },
+        ligado: false,
+    });
+
+    // Deixa a animação de inicialização terminar e liga a máquina.
+    for _ in 0..(10 * TIQUES_POR_SEGUNDO) {
+        m.trata(Evento::Tique);
+        if m.fotografia().desligada {
+            break;
+        }
+    }
+    m.trata(Evento::BotaoPressionado(Botao::OnOff));
+    m.trata(Evento::BotaoSolto(Botao::OnOff));
+
+    // Roda com os sensores TRAVADOS — é isso que estoura o tempo limite.
+    let mut erro = None;
+    for s in 0..LIMITE_BUSCA_S {
+        for _ in 0..TIQUES_POR_SEGUNDO {
+            m.trata(Evento::Tique);
+        }
+        // O vazamento: 10 s depois de ligar, já dentro da agitação e
+        // passada a carência de 3 s do sensor.
+        if matches!(falha, Falha::NivelCai) && s == 10 {
+            m.trata(Evento::NivelMedio { atingido: false });
+        }
+        m.trata(Evento::Segundo);
+        if let Some(e) = m.fotografia().erro {
+            erro = Some(e);
+            break;
+        }
+    }
+    let erro = erro?;
+
+    // Três repetições completas do código.
+    let ciclo = (erro.piscadas() * maquina::TIQUES_ERRO_PISCADA
+        + maquina::TIQUES_ERRO_PAUSA) as usize;
+    let mut traco = Vec::with_capacity(ciclo * 3);
+    for _ in 0..(ciclo * 3) {
+        m.trata(Evento::Tique);
+        traco.push(painel.todos().iter().filter(|l| l.esta_ligada()).count());
+    }
+
+    Some((erro, traco))
+}
+
+/// Comprimentos dos trechos acesos e dos trechos apagados, em tiques.
+fn trechos(traco: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let mut acesos = Vec::new();
+    let mut apagados = Vec::new();
+    let mut i = 0;
+    while i < traco.len() {
+        let ligado = traco[i] > 0;
+        let inicio = i;
+        while i < traco.len() && (traco[i] > 0) == ligado {
+            i += 1;
+        }
+        if ligado {
+            acesos.push(i - inicio);
+        } else {
+            apagados.push(i - inicio);
+        }
+    }
+    (acesos, apagados)
+}
+
+fn verifica_codigo(falha: Falha) -> Vec<String> {
+    let mut problemas = Vec::new();
+
+    let Some((erro, traco)) = captura_codigo(falha) else {
+        return vec![format!(
+            "a falha \"{}\" não levou a máquina a erro nenhum em {} min simulados",
+            falha.nome(),
+            LIMITE_BUSCA_S / 60
+        )];
+    };
+
+    // 1. É o erro certo?
+    if erro != falha.esperado() {
+        problemas.push(format!(
+            "entrou em {:?}, esperado {:?}",
+            erro,
+            falha.esperado()
+        ));
+    }
+
+    let piscadas = erro.piscadas() as usize;
+    println!(
+        "=== {} → {:?}, {} piscadas",
+        falha.nome(),
+        erro,
+        piscadas
+    );
+
+    // 2. Os 10 LEDs andam juntos — nunca um subconjunto aceso.
+    if let Some(&n) = traco.iter().find(|&&n| n != 0 && n != 10) {
+        problemas.push(format!(
+            "o painel mostrou {n} LED(s) acesos; o código pisca os 10 juntos"
+        ));
+    }
+
+    let (acesos, apagados) = trechos(&traco);
+
+    // 3. Três repetições → 3 × N piscadas, nenhuma a mais, nenhuma a menos.
+    if acesos.len() != piscadas * 3 {
+        problemas.push(format!(
+            "contei {} piscadas em 3 repetições, esperado {} (3 × {piscadas})",
+            acesos.len(),
+            piscadas * 3
+        ));
+    }
+
+    // 4. Toda piscada tem a mesma duração.
+    if acesos
+        .iter()
+        .any(|&t| t != maquina::TIQUES_ERRO_ACESO as usize)
+    {
+        problemas.push(format!(
+            "piscadas com durações diferentes: {acesos:?} tiques (esperado {})",
+            maquina::TIQUES_ERRO_ACESO
+        ));
+    }
+
+    // 5. Existem só dois tamanhos de escuro: o intervalo entre piscadas e a
+    //    pausa. E a pausa tem de ser bem maior, senão não se sabe onde a
+    //    contagem começa.
+    let curto = maquina::TIQUES_ERRO_APAGADO as usize;
+    let longo = (maquina::TIQUES_ERRO_APAGADO + maquina::TIQUES_ERRO_PAUSA) as usize;
+    if let Some(&t) = apagados.iter().find(|&&t| t != curto && t != longo) {
+        problemas.push(format!(
+            "escuro de {t} tiques fora de padrão (esperado {curto} entre piscadas ou {longo} na pausa)"
+        ));
+    }
+    if longo < curto * 3 {
+        problemas.push(format!(
+            "a pausa ({longo} tiques) não é bem maior que o intervalo entre piscadas ({curto}); a contagem fica ambígua"
+        ));
+    }
+
+    // 6. Desenha o que o técnico vê, para conferir de olho.
+    let desenho: String = traco
+        .iter()
+        .take(traco.len() / 3)
+        .map(|&n| if n > 0 { '▀' } else { '_' })
+        .collect();
+    println!(
+        "  {desenho}  ({:.1} s por repetição)",
+        traco.len() as f32 / 3.0 * 0.05
+    );
+
+    problemas
+}
+
+/// Dois erros com o mesmo número de piscadas seriam indistinguíveis.
+fn verifica_codigos_distintos() -> Vec<String> {
+    let mut problemas = Vec::new();
+    for (i, a) in FALHAS.iter().enumerate() {
+        for b in FALHAS.iter().skip(i + 1) {
+            if a.esperado().piscadas() == b.esperado().piscadas() {
+                problemas.push(format!(
+                    "{:?} e {:?} piscam as duas {} vezes — indistinguíveis",
+                    a.esperado(),
+                    b.esperado(),
+                    a.esperado().piscadas()
+                ));
+            }
+        }
+    }
+    // Uma piscada só se confundiria com o pisca de tampa aberta.
+    for f in FALHAS {
+        if f.esperado().piscadas() < 2 {
+            problemas.push(format!(
+                "{:?} pisca {} vez; o código tem de começar em 2",
+                f.esperado(),
+                f.esperado().piscadas()
+            ));
+        }
+    }
+    problemas
+}
+
 const TODOS: [Programa; 5] = [
     Programa::Pesada,
     Programa::Normal,
@@ -668,9 +935,31 @@ fn main() {
         }
     }
 
+    // ── Os códigos de erro piscados no painel ────────────────────────────────
+    println!();
+    for f in verifica_codigos_distintos() {
+        problemas += 1;
+        println!("  ✘ {f}");
+    }
+    for falha in FALHAS {
+        let falhas = verifica_codigo(falha);
+        if falhas.is_empty() {
+            println!("  ✔ sem problemas");
+        } else {
+            problemas += falhas.len();
+            for f in falhas {
+                println!("  ✘ {f}");
+            }
+        }
+    }
+
     println!();
     if problemas == 0 {
-        println!("Tudo certo: {rodados} ciclos simulados de ponta a ponta.");
+        println!(
+            "Tudo certo: {rodados} ciclos simulados de ponta a ponta \
+             e {} códigos de erro conferidos.",
+            FALHAS.len()
+        );
     } else {
         println!("{problemas} problema(s) encontrado(s).");
         std::process::exit(1);
