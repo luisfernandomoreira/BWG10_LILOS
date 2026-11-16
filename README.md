@@ -6,6 +6,11 @@ com uma arquitetura **baseada em eventos**.
 
 A placa é a mesma. Só mudou o microcontrolador.
 
+> Atendendo a máquina em campo? Vá direto ao
+> **[Apêndice — Manual do técnico](#apêndice--manual-do-técnico-em-campo)**:
+> proteções, códigos de erro piscados e auto-teste, autocontido e sem
+> precisar do resto.
+
 ---
 
 ## 1. Por que a placa não muda
@@ -960,12 +965,18 @@ tudo (seção 12).
 
 ## 14. O que ainda falta
 
-Estes pontos ficaram de fora e estão marcados no código:
+A máquina já roda com este firmware e se comporta bem em ciclo
+completo. O que ainda merece atenção:
 
-* **A lógica não foi testada em hardware.** O firmware já grava e
-  verifica na placa, mas nenhum ciclo foi rodado. Comece pelo auto-teste
-  (seção 12), que liga um atuador de cada vez — e com a potência
-  desligada na primeira passada.
+* **A vigilância de nível no molho do enxágue é nova.** É a única etapa
+  cujo comportamento mudou: antes ela não podia gerar erro. Com amaciante
+  ligado, fica 32 min 40 s segurando água, e é o caso que vale rodar até
+  o fim depois de gravar. Um erro de nível (2 piscadas) ali sem vazamento
+  real significa que o flutuador oscila com a água parada — o ajuste é
+  `LIMITE_NIVEL_CAIU`, em `programa.rs`.
+* **A persistência na flash e o debounce** não são cobertos pelas
+  conferências no PC (seção 7). A retomada dá para testar tirando da
+  tomada no meio de um ciclo; o debounce só aparece com uso.
 
 ---
 
@@ -977,3 +988,174 @@ Estes pontos ficaram de fora e estão marcados no código:
 * [AN240 — GD32C2x1 Hardware Development Guide](https://www.gd32mcu.com/data/documents/applicationNote/AN240%20GD32C2x1%20Hardware%20Development%20Guide_Rev1.0.pdf)
 * [lilos 1.3 — documentação](https://docs.rs/lilos/1.3.0/lilos/)
 * [Firmware original (STM32 + Embassy)](https://github.com/luisfernandomoreira/BWG10_BWC07_RUST)
+
+---
+
+# Apêndice — Manual do técnico em campo
+
+As seções acima são para quem mexe no firmware. Este apêndice é para quem
+atende a máquina: o que o firmware trava por segurança, como ler o código
+piscado no painel e como rodar o auto-teste. É autocontido — dá para
+imprimir só ele.
+
+A máquina não tem display. **Todo diagnóstico sai pelos 10 LEDs do painel.**
+
+## A.1 Proteções
+
+Todas agem sozinhas. Três param a máquina e piscam um código; as outras só
+desligam saídas.
+
+| Proteção | O que faz | Tempo |
+|---|---|---|
+| Triacs desligados no boot | escreve o nível de repouso no pino antes de configurá-lo como saída | imediato |
+| Tampa aberta | desliga tudo na hora, em qualquer estado | imediato |
+| Religamento após fechar a tampa | espera antes de reenergizar; o tempo da etapa fica congelado | 2 s |
+| Confirmação no boot | após queda de energia, espera antes de retomar o ciclo salvo | 2 s |
+| Troca de sentido do motor | retira o sentido anterior antes de energizar o outro | imediato |
+| Espera de câmbio | antes de `Pulsos` e `Centrifugar`, dá tempo ao câmbio de posicionar | 10 s |
+| Não encheu | trava e pisca | 40 min |
+| Não esvaziou | trava e pisca | 4 min 20 s |
+| Nível caiu sozinho | trava e pisca, em qualquer etapa que retém água | 5 s, após 3 s de carência |
+| Watchdog | se qualquer tarefa travar, o MCU reinicia sozinho | 8 s |
+| `panic` | trava o núcleo e o watchdog reseta | 8 s |
+
+Dois detalhes que mudam o diagnóstico:
+
+* **A carência de 3 s** no início de cada etapa existe porque o flutuador
+  balança quando a água entra. Antes disso o nível não é cobrado.
+* **As 5 leituras são consecutivas.** Qualquer segundo com o sensor de
+  volta zera a contagem. Erro de nível significa 5 segundos inteiros sem
+  sensor, não uma oscilação.
+
+Erro travado só sai apertando **ON/OFF**. Não precisa tirar da tomada, e o
+ciclo salvo volta no próximo boot.
+
+## A.2 Códigos de erro
+
+Os **10 LEDs piscam juntos**, N vezes, e o código repete para sempre até
+alguém apertar ON/OFF. Conte as piscadas de um grupo.
+
+| Piscadas | Erro | O que aconteceu | O que suspeitar, na ordem |
+|---|---|---|---|
+| **2** | Nível | o nível caiu sozinho numa etapa que retém água — agitação, molho ou molho do enxágue (5 leituras seguidas) | vazamento; mangueira solta; sensor de nível solto ou com mau contato |
+| **3** | Encher | passaram 40 min enchendo e o nível escolhido não chegou | torneira fechada ou com pressão baixa; válvula de sabão; sensor de nível |
+| **4** | Drenar | passaram 4 min 20 s drenando e o tanque não esvaziou | eletrobomba; mangueira de saída dobrada; filtro entupido |
+
+Os três códigos no tempo — cada caractere vale 50 ms:
+
+```text
+2 piscadas · Nível    ▀▀▀▀▀_____▀▀▀▀▀___________________________________            repete a cada 2,5 s
+3 piscadas · Encher   ▀▀▀▀▀_____▀▀▀▀▀_____▀▀▀▀▀___________________________________       repete a cada 3,0 s
+4 piscadas · Drenar   ▀▀▀▀▀_____▀▀▀▀▀_____▀▀▀▀▀_____▀▀▀▀▀___________________________________  repete a cada 3,5 s
+```
+
+O que separa um grupo do seguinte é o **escuro longo de 1,5 s** — três
+vezes maior que o intervalo entre piscadas, justamente para se saber onde
+a contagem começa. Se não der para contar de primeira, espere o escuro
+longo e conte do início.
+
+A contagem **começa em 2 de propósito**: uma piscada só se confundiria com
+o pisca do LED de programa, que é o aviso de tampa aberta. Então:
+
+* **um LED piscando sozinho** = tampa aberta, não é erro;
+* **os 10 juntos** = erro travado, conte as piscadas.
+
+Se as piscadas tiverem durações diferentes entre si, se o escuro longo não
+aparecer, ou se só um subconjunto dos LEDs acender, não é código de erro —
+suspeite da fiação do painel ou da placa.
+
+## A.3 Auto-teste da placa
+
+Liga **um atuador por vez**, com a máquina aberta, para conferir cada um
+isoladamente sem rodar um ciclo inteiro. Cada passo desliga tudo antes de
+ligar o seu, então nunca há dois atuadores energizados por engano.
+
+### Como entrar
+
+1. Com a máquina **recém-energizada e desligada**, segure **SELETOR +
+   NÍVEL** juntos dentro dos **primeiros 15 s**. Pode já estar segurando
+   na hora de ligar na tomada.
+2. Os **dois LEDs de nível piscam** — é a confirmação de que o modo abriu.
+3. **Solte os dois botões.** O primeiro passo só começa depois disso, para
+   o avanço não acontecer sozinho.
+
+Passados os 15 s, ou com a máquina em ciclo, a combinação é ignorada. Não
+dá para cair no modo sem querer durante o uso normal.
+
+### Os cinco passos
+
+| LED aceso | O que liga | Como sair do passo |
+|---|---|---|
+| Lavagem pesada | válvula de sabão | SELETOR |
+| Lavagem normal | válvula de amaciante | SELETOR |
+| Lavagem rápida | motor agitando (padrão normal, sem turbo) | SELETOR |
+| Enxaguar | eletrobomba | 60 s, ou NÍVEL para atalhar |
+| Centrifugar | motor C **+** eletrobomba | SELETOR encerra o modo |
+
+Nos três primeiros passos e no último **o tempo não corre**: o atuador fica
+ligado até apertar o botão. Só o passo da bomba tem tempo próprio.
+
+No passo da bomba o **SELETOR é ignorado de propósito**: são os 60 s (ou o
+atalho pelo NÍVEL) que garantem ao câmbio tempo de posicionar antes do
+motor C entrar no passo seguinte.
+
+**ON/OFF sai do auto-teste a qualquer momento** e desliga tudo.
+
+> ⚠ **O auto-teste ignora o sensor de tampa.** É proposital — o técnico
+> precisa ver as válvulas e o motor com a máquina aberta. Por isso o modo
+> só abre com gesto de dois botões e só nos primeiros 15 s. Com a máquina
+> aberta e o motor energizado, **não ponha a mão no tanque.**
+
+## A.4 Como testar
+
+Em campo você está testando **a máquina**, não o firmware: que a válvula
+abre, que a bomba puxa, que o sensor responde. A lógica dos códigos de erro
+já é conferida no PC antes de cada gravação (seção 7).
+
+### Confira no auto-teste
+
+Um item por passo. Se algum falhar, o problema está naquele atuador ou na
+fiação dele — não na lógica.
+
+- [ ] **Válvula de sabão** (LED lavagem pesada): entra água pelo compartimento de sabão
+- [ ] **Válvula de amaciante** (LED lavagem normal): entra água pelo compartimento de amaciante
+- [ ] **Motor agitando** (LED lavagem rápida): o tambor vai para um lado, pausa, vai para o outro — nunca os dois sentidos juntos
+- [ ] **Eletrobomba** (LED enxaguar): a bomba puxa e sai água pela mangueira de saída
+- [ ] **Motor C + bomba** (LED centrifugar): o tambor gira num sentido só, com a bomba ligada
+- [ ] **ON/OFF** encerra e desliga tudo em qualquer passo
+
+Um atuador que não liga em nenhum passo, mas os outros ligam, aponta o
+triac ou o fio dele. Nada ligando em passo nenhum aponta a alimentação da
+placa de potência.
+
+### Provocar cada erro
+
+| Erro | Como provocar | Espera | O que deve acontecer |
+|---|---|---|---|
+| **Encher** (3 piscadas) | feche a torneira e inicie qualquer programa | 40 min | trava, desliga tudo, pisca 3 |
+| **Drenar** (4 piscadas) | com água no tanque, dobre a mangueira de saída e deixe chegar na drenagem | 4 min 20 s | trava, desliga tudo, pisca 4 |
+| **Nível** (2 piscadas) | numa etapa com água parada, desligue o conector do sensor de nível | 5 s a 8 s | trava, desliga tudo, pisca 2 |
+
+O teste do nível é o único rápido. Os outros dois são tempos limite longos
+de propósito — uma torneira com pressão baixa não pode virar erro. Na
+prática, confirme os dois longos uma vez na bancada e em campo confie no
+código piscado.
+
+Depois de cada teste, **aperte ON/OFF** para destravar. Desfaça a falha
+antes de rodar um ciclo de verdade.
+
+> ⚠ Provocar erro de propósito mexe numa placa **energizada na rede**.
+> Prefira sempre o conector do sensor e a mangueira — nunca os terminais
+> dos triacs. Com o motor energizado, não ponha a mão no tanque.
+
+### O que o teste em campo não cobre
+
+Duas coisas só aparecem com uso prolongado:
+
+* a gravação do estado na memória, que faz a máquina retomar o ciclo
+  depois de uma queda de energia (seção 11);
+* o filtro de ruído dos botões e sensores.
+
+Para conferir a retomada, basta tirar da tomada no meio de um ciclo e
+religar: a máquina deve voltar na mesma etapa, após 2 s de confirmação e
+respeitando a tampa.
