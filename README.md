@@ -658,6 +658,30 @@ cargo objcopy --release -- -O ihex bwg10_lilos.hex
 Esse `.hex` também serve para o **GD32 All-In-One Programmer** com um
 GD-Link — alternativa válida se o probe-rs der problema com o gravador.
 
+O `.hex` **não é versionado** (está no `.gitignore`): é artefato de build,
+sempre regerado do código. Depois de gerar, vale conferir que ele começa em
+`0x08000000` e termina antes de `0x0800FC00` — a página 63, que guarda o
+estado salvo (seção 11) e não entra na imagem.
+
+**Se der `error: no such command: objcopy`**, falta o `cargo-binutils` do
+passo "Preparar o ambiente" acima. Para gerar sem instalar nada, dá para
+chamar direto o `llvm-objcopy` — é o mesmo programa que o `cargo objcopy`
+embrulha, e a saída é byte a byte igual. Ele não compila por conta própria,
+então o `cargo build --release` vem antes. Em PowerShell, na raiz do
+projeto:
+
+```powershell
+cargo build --release
+$objcopy = Get-ChildItem (rustc --print sysroot) -Recurse -Filter llvm-objcopy.exe |
+    Select-Object -First 1 -ExpandProperty FullName
+& $objcopy -O ihex target/thumbv6m-none-eabi/release/bwg10_lilos bwg10_lilos.hex
+```
+
+O `Get-ChildItem` evita escrever o *host triple* na mão: o executável fica
+em `<sysroot>/lib/rustlib/<triple>/bin/`, e o `<triple>` muda de máquina
+para máquina. Ele vem do componente `llvm-tools`, que também está no
+"Preparar o ambiente".
+
 ---
 
 ## 8. Alvo de compilação — por que `thumbv6m` e não `thumbv8m.base`
