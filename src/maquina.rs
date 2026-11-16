@@ -610,6 +610,9 @@ impl<'a> Maquina<'a> {
             }
             Acao::Agitar | Acao::Molho => self.segundo_com_agua(etapa),
             Acao::MolhoEnxague => {
+                if !self.vigia_nivel() {
+                    return;
+                }
                 if self.molho_amaciante {
                     if self.fase_amaciante().is_none() {
                         self.avanca_etapa();
@@ -636,6 +639,13 @@ impl<'a> Maquina<'a> {
     }
 
     fn segundo_com_agua(&mut self, etapa: Etapa) {
+        if self.vigia_nivel() {
+            self.termina_etapa_por_tempo(etapa);
+        }
+    }
+
+    /// A mesma proteção vale para todas as etapas que mantêm água.
+    fn vigia_nivel(&mut self) -> bool {
         // Vigia se o nível caiu sozinho — vazamento ou sensor solto.
         if self.segundos_etapa > CARENCIA_SENSOR_S {
             let caiu = if self.encheu_com_nivel_alto {
@@ -647,13 +657,13 @@ impl<'a> Maquina<'a> {
                 self.nivel_caiu += 1;
                 if self.nivel_caiu >= LIMITE_NIVEL_CAIU {
                     self.entra_em_erro(Erro::Nivel);
-                    return;
+                    return false;
                 }
             } else {
                 self.nivel_caiu = 0;
             }
         }
-        self.termina_etapa_por_tempo(etapa);
+        true
     }
 
     fn segundo_drenando(&mut self) {

@@ -1,10 +1,22 @@
 //! Roda a máquina de estados REAL (`src/maquina.rs`) no PC e confere se ela
 //! percorre todas as etapas de cada programa e desliga no fim.
 //!
-//! Compilar e rodar, na raiz do projeto:
+//! O arquivo tem DOIS modos. O `--edition 2021` é obrigatório nos dois:
+//! sem ele o `rustc` usa a edição 2015, onde os `use` internos da
+//! `maquina.rs` não resolvem.
+//!
+//! 1. O `main()` — varredura curta, legível, que imprime cada ciclo e o
+//!    traço dos códigos de erro. Na raiz do projeto:
 //!
 //! ```text
-//! rustc -O ferramentas/simular_ciclo.rs -o simular && ./simular
+//! rustc -O --edition 2021 ferramentas/simular_ciclo.rs -o simular && ./simular
+//! ```
+//!
+//! 2. O `mod testes` (`#[cfg(test)]`, no fim do arquivo) — varredura larga,
+//!    sem saída para ler, com os casos que o `main()` não cobre:
+//!
+//! ```text
+//! rustc --test -O --edition 2021 ferramentas/simular_ciclo.rs -o testes && ./testes
 //! ```
 //!
 //! Não é um teste de uma cópia do código: `maquina.rs`, `programa.rs`,
@@ -16,7 +28,8 @@
 //! Se um dia alguém acrescentar uma variante em `Evento` e tratá-la na
 //! máquina, este arquivo para de compilar — que é o aviso desejado.
 //!
-//! O que é verificado, para os 5 programas × com e sem enxágue extra:
+//! O que o `main()` verifica, para os 5 programas × com e sem enxágue
+//! extra × tanque vazio/cheio:
 //!
 //!   1. a máquina entra em execução depois do liga/desliga;
 //!   2. passa por TODAS as etapas aplicáveis da tabela, em ordem,
@@ -27,6 +40,20 @@
 //!      opções e fica DESLIGADA — igual ao firmware original;
 //!   6. nos outros programas: termina em "concluída", ainda ligada,
 //!      esperando o seletor.
+//!
+//! O que o `mod testes` acrescenta:
+//!
+//!   * os 5 programas × TODAS as 16 combinações de opções × tanque
+//!     vazio/cheio = 160 ciclos, conferindo também as etapas vistas;
+//!   * a queda de nível em `MolhoEnxague`, com e sem amaciante e nos dois
+//!     níveis — a etapa fica até ~33 min com água retida;
+//!   * a tampa pausando e retomando a agitação, sem perder o tempo da
+//!     etapa e respeitando os 2 s de religamento;
+//!   * o boot restaurando a etapa salva e honrando o bit `ligado`, com a
+//!     espera de câmbio antes da centrifugação.
+//!
+//! Fora de alcance aqui, só na placa: a gravação real na flash e o
+//! debounce das entradas.
 
 #![allow(dead_code)]
 
@@ -359,6 +386,10 @@ struct Resultado {
 }
 
 fn simula(programa: Programa, enxague_extra: bool, nivel_inicial: i32) -> Resultado {
+    simula_com_opcoes(programa, Opcoes { enxague_extra, ..Opcoes::padrao() }, nivel_inicial)
+}
+
+fn simula_com_opcoes(programa: Programa, opcoes: Opcoes, nivel_inicial: i32) -> Resultado {
     let painel = Painel::nova();
     let at = Atuadores::novos();
     let entradas = Entradas::novas();
@@ -372,12 +403,7 @@ fn simula(programa: Programa, enxague_extra: bool, nivel_inicial: i32) -> Result
     m.restaura(EstadoSalvo {
         programa,
         etapa: 0,
-        opcoes: Opcoes {
-            nivel_alto: false,
-            enxague_extra,
-            turbo: false,
-            amaciante: false,
-        },
+        opcoes,
         ligado: false,
     });
 
@@ -913,6 +939,129 @@ const TODOS: [Programa; 5] = [
     Programa::Enxaguar,
     Programa::Centrifugar,
 ];
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    fn tiques(m: &mut maquina::Maquina<'_>, n: usize) {
+        for _ in 0..n {
+            m.trata(Evento::Tique);
+        }
+    }
+
+    #[test]
+    fn todas_as_opcoes_completam_os_ciclos() {
+        for p in TODOS {
+            for bits in 0..16 {
+                let opcoes = Opcoes::de_byte(bits);
+                for cenario in [Cenario::Vazio, Cenario::Cheio] {
+                    let r = simula_com_opcoes(p, opcoes, cenario.nivel());
+                    assert!(r.terminou && r.desligada && !r.triacs_ligados,
+                        "programa={p:?}, opções={bits}, tanque={}", cenario.nome());
+                    assert_eq!(r.etapas_vistas, etapas_esperadas(p, opcoes.enxague_extra, cenario));
+                    assert_eq!(r.programa_final, Programa::Pesada);
+                    assert!(r.opcoes_finais == Opcoes::padrao());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queda_de_nivel_no_molho_enxague_desliga_saidas() {
+        for amaciante in [false, true] {
+            for nivel_alto in [false, true] {
+                let painel = Painel::nova();
+                let at = Atuadores::novos();
+                let entradas = Entradas::novas();
+                entradas.nivel_medio.set(true);
+                entradas.nivel_alto.set(nivel_alto);
+                let mut m = maquina::Maquina::nova(&painel, &at, &entradas);
+                m.restaura(EstadoSalvo {
+                    programa: Programa::Enxaguar, etapa: 7, ligado: true,
+                    opcoes: Opcoes { amaciante, nivel_alto, ..Opcoes::padrao() },
+                });
+                tiques(&mut m, 90);
+                assert!(m.fotografia().executando);
+                // Com amaciante, exercita também a fase que agita.
+                if amaciante {
+                    for _ in 0..301 {
+                        tiques(&mut m, 20);
+                        m.trata(Evento::Segundo);
+                    }
+                    let mut agitou = false;
+                    for _ in 0..20 {
+                        tiques(&mut m, 1);
+                        agitou |= at.motor_a.esta_ligada() || at.motor_c.esta_ligada();
+                    }
+                    assert!(agitou);
+                }
+                m.trata(if nivel_alto { Evento::NivelAlto { atingido: false } }
+                    else { Evento::NivelMedio { atingido: false } });
+                for _ in 0..8 {
+                    tiques(&mut m, 20);
+                    m.trata(Evento::Segundo);
+                }
+                assert_eq!(m.fotografia().erro, Some(maquina::Erro::Nivel));
+                assert!(!at.algum_ligado());
+            }
+        }
+    }
+
+    #[test]
+    fn tampa_pausa_e_retoma_agitacao_com_espera() {
+        let painel = Painel::nova();
+        let at = Atuadores::novos();
+        let entradas = Entradas::novas();
+        entradas.nivel_medio.set(true);
+        let mut m = maquina::Maquina::nova(&painel, &at, &entradas);
+        m.restaura(EstadoSalvo { programa: Programa::Rapido, etapa: 1,
+            opcoes: Opcoes::padrao(), ligado: true });
+        tiques(&mut m, 91);
+        assert!(at.motor_a.esta_ligada() || at.motor_c.esta_ligada());
+        m.trata(Evento::Tampa { aberta: true });
+        let antes = m.fotografia();
+        for _ in 0..5 {
+            tiques(&mut m, 20);
+            m.trata(Evento::Segundo);
+            assert!(!at.algum_ligado());
+        }
+        assert_eq!(m.fotografia().segundos_etapa, antes.segundos_etapa);
+        m.trata(Evento::Tampa { aberta: false });
+        tiques(&mut m, 39);
+        assert!(!at.algum_ligado());
+        tiques(&mut m, 2);
+        assert!(m.fotografia().executando);
+        assert_eq!(m.fotografia().etapa, antes.etapa);
+        assert!(at.motor_a.esta_ligada() || at.motor_c.esta_ligada());
+    }
+
+    #[test]
+    fn boot_restaura_etapa_e_respeita_estado_ligado() {
+        for ligado in [false, true] {
+            let painel = Painel::nova();
+            let at = Atuadores::novos();
+            let entradas = Entradas::novas();
+            let mut m = maquina::Maquina::nova(&painel, &at, &entradas);
+            m.restaura(EstadoSalvo { programa: Programa::Centrifugar, etapa: 3,
+                opcoes: Opcoes::padrao(), ligado });
+            tiques(&mut m, 89);
+            assert!(!at.algum_ligado());
+            tiques(&mut m, 1);
+            assert_eq!(m.fotografia().executando, ligado);
+            assert_eq!(m.fotografia().desligada, !ligado);
+            assert_eq!(m.fotografia().etapa, 3);
+            if ligado {
+                assert!(at.eletrobomba.esta_ligada());
+                assert!(!at.motor_c.esta_ligada());
+                tiques(&mut m, 199);
+                assert!(!at.motor_c.esta_ligada());
+                tiques(&mut m, 1);
+                assert!(at.motor_c.esta_ligada());
+            }
+        }
+    }
+}
 
 fn main() {
     let mut problemas = 0;

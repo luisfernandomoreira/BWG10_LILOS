@@ -375,7 +375,7 @@ etapa depende da ação — e é aí que está o coração da lógica:
 |---|---|---|
 | `EncherSabao`, `EncherEnxague`, `EncherAmaciante` | o **sensor** do nível escolhido é atingido | passam 40 min → `Erro::Encher` (3 piscadas) |
 | `Agitar`, `Molho` | o tempo da tabela se esgota | o nível cai em 5 leituras → `Erro::Nivel` (2 piscadas) |
-| `MolhoEnxague` | o tempo se esgota, ou a sequência do amaciante acaba | — |
+| `MolhoEnxague` | o tempo se esgota, ou a sequência do amaciante acaba | o nível cai em 5 leituras → `Erro::Nivel` (2 piscadas) |
 | `Drenar` | os **dois** sensores de nível soltam | passam 4 min 20 s → `Erro::Drenar` (4 piscadas) |
 | `Pulsos` | a tabela de pulsos progressivos acaba | — |
 | `DrenarExtra`, `Centrifugar`, `BombaPos`, `PausaFinal` | o tempo da tabela se esgota | — |
@@ -564,6 +564,25 @@ agitação —, espera o tempo limite estourar e lê o painel tique a tique:
 Ela imprime o traço de cada código em `▀` e `_`, do jeito que se vê na
 máquina. É o único jeito prático de conferir isso: na placa, cada erro
 custaria até 40 min de tempo limite para aparecer uma vez.
+
+**O mesmo arquivo em modo de teste** — `simular_ciclo.rs` também carrega
+um módulo `#[cfg(test)]` com uma varredura mais larga, que o `main()` não
+faz. Na raiz do projeto, em PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force target/revisao | Out-Null
+rustc --test --edition 2021 -O ferramentas/simular_ciclo.rs -o target/revisao/testes.exe
+if ($LASTEXITCODE -eq 0) { & ./target/revisao/testes.exe }
+```
+
+Além dos padrões de agitação, os testes verificam 160 ciclos (5 programas
+× **todas** as 16 combinações de opções × tanque vazio/cheio), a queda de
+nível no molho do enxágue com e sem amaciante e nos dois níveis, a pausa e
+a retomada pela tampa, e a restauração do estado salvo no boot (seção 11)
+com a espera de câmbio antes da centrifugação.
+
+A persistência física na flash e o debounce das entradas não dão para
+cobrir aqui — dependem de validação na placa.
 
 O `--edition 2021` é obrigatório: o `rustc` chamado solto usa a edição
 2015, onde os `use` internos da `maquina.rs` não resolvem.
@@ -756,7 +775,7 @@ piscadas**. Os 10 LEDs piscam juntos N vezes, o painel fica escuro por
 
 | Piscadas | Erro | O que aconteceu | O que suspeitar |
 |---|---|---|---|
-| **2** | `Nivel` | o nível caiu sozinho durante a agitação ou o molho (5 leituras seguidas) | vazamento, mangueira solta, sensor de nível solto |
+| **2** | `Nivel` | o nível caiu sozinho numa etapa que retém água — agitação, molho ou molho do enxágue (5 leituras seguidas) | vazamento, mangueira solta, sensor de nível solto |
 | **3** | `Encher` | passaram 40 min enchendo e o nível escolhido não chegou | torneira fechada, válvula de sabão, sensor de nível |
 | **4** | `Drenar` | passaram 4 min 20 s drenando e o tanque não esvaziou | eletrobomba, mangueira de saída dobrada, filtro entupido |
 
